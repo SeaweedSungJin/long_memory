@@ -28,7 +28,8 @@ import torch
 from gr00t.long_memory.cache import EpisodeCache
 from gr00t.long_memory.cache_reader_v3 import MappedEpisodes, validate_decision
 from gr00t.long_memory.expert_v4 import (LoRAConfig, adapter_disabled, expert_episode_flow_loss,
-    expert_parameters, install_expert_lora, set_expert_trainable)
+    expert_parameters, expert_state_sha256, install_expert_lora, set_expert_trainable)
+from gr00t.long_memory.checkpoint_v4 import _state_sha256
 from gr00t.long_memory.hamlet import checkpoint_identity, isolated_seed, load_frozen_hamlet, validate_cache_checkpoint
 from gr00t.long_memory.monitoring import RunLogger, _atomic_json
 from gr00t.long_memory.safety_v5 import validate_output_scope
@@ -244,6 +245,9 @@ def run(args, cfg, expert_cfg, cache, episodes, plan, plan_sha, sources, initial
     set_expert_trainable(head, True)
     assert_scope(core, head)
     optimizer = torch.optim.AdamW(optimizer_groups(args, core, head))
+    shared_init = _state_sha256({k: v for k, v in core.delta_state_dict().items()
+                                if k.startswith("memory.") and not k.startswith("memory.fusion_gate.")})
+    expert_init = expert_state_sha256(head)
     if initial:
         load_checkpoint_v18(args.resume, core, head, optimizer)
     config = {"representation": asdict(cfg), "expert": asdict(expert_cfg), "expert_targets": targets,
@@ -252,6 +256,8 @@ def run(args, cfg, expert_cfg, cache, episodes, plan, plan_sha, sources, initial
     metadata = {"base_model": checkpoint_identity(base_path), "cache_fingerprint": cache.manifest["fingerprint"],
         "cache_dir": str(Path(cache.path).resolve()), "plan_sha256": plan_sha, "source_sha256": sources,
         "runtime": runtime_identity(), "initialization": "original_author_HAMLET_plus_fresh_reader_zero_AE_LoRA",
+        "initial_shared_reader_sha256": initial["metadata"]["initial_shared_reader_sha256"] if initial else shared_init,
+        "initial_expert_sha256": initial["metadata"]["initial_expert_sha256"] if initial else expert_init,
         "initial_core_sha256": digest({k: hashlib.sha256(v.cpu().contiguous().numpy().tobytes()).hexdigest()
                                         for k, v in core.delta_state_dict().items()}),
         "resume_parent": str(Path(args.resume).resolve()) if args.resume else None}

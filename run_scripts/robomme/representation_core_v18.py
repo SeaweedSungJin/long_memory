@@ -2,7 +2,12 @@
 
 A (short): frozen HAMLET short tokens supply both query and stored event.
 B (adapted_short): a *separate copy* of HAMLET's temporal Transformer gets
-    attention LoRA; all past short tokens are recomputed with current weights.
+    attention LoRA; all past short deltas are recomputed with current weights.
+    H_B = native_H + T_LoRA(quantized_m) - stopgrad(T_base(quantized_m)).
+    This anchoring is necessary because the existing cache rounded normalized
+    FP32 moments to BF16, whereas its stored native_H used full-precision
+    normalized moments. It preserves exact A/B equality at zero LoRA without
+    rerunning the VLM or pretending the rounded cache is lossless.
 C (moment): query remains frozen short; only stored features become the cached
     VLLN-normalized, pre-HAMLET moment tokens.
 
@@ -15,6 +20,7 @@ Original AE safety assertions therefore remain intact. The caller supplies
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import math
 from typing import Callable
@@ -28,11 +34,12 @@ from gr00t.long_memory.recurrent_v7 import MemoryV7Config, RecurrentMemoryV7
 from gr00t.long_memory.replay_v7 import _validate_prefix
 
 
-CORE_VERSION = "representation_v18_fifo_v1"
+CORE_VERSION = "representation_v18_anchored_fifo_v1"
 
 
 @dataclass(frozen=True)
 class RepresentationConfigV18:
+    version: str = CORE_VERSION
     feature_dim: int = 2048
     state_dim: int = 128
     num_short_tokens: int = 4
@@ -47,6 +54,8 @@ class RepresentationConfigV18:
     time_scale: float = 16.0
 
     def __post_init__(self):
+        if self.version != CORE_VERSION:
+            raise ValueError("Unsupported V18 representation algorithm version")
         for name in ("feature_dim", "state_dim", "num_short_tokens", "hidden_dim",
                      "num_heads", "capacity_events", "short_window", "short_lora_rank"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
@@ -76,6 +85,7 @@ class ShortLoRALinearV18(nn.Module):
         self.base = base.requires_grad_(False)
         self.in_features, self.out_features = base.in_features, base.out_features
         self.scale = float(alpha) / rank
+        self.enabled = True
         self.lora_A = nn.Parameter(torch.empty(rank, base.in_features, device=base.weight.device, dtype=torch.float32))
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device, dtype=torch.float32))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -86,6 +96,8 @@ class ShortLoRALinearV18(nn.Module):
 
     def forward(self, x):
         original = self.base(x)
+        if not self.enabled:
+            return original
         with torch.autocast(device_type=x.device.type, enabled=False):
             delta = F.linear(F.linear(x.float(), self.lora_A), self.lora_B) * self.scale
         return original + delta.to(original.dtype)
@@ -206,28 +218,56 @@ class RepresentationMemoryV18(nn.Module):
             raise ValueError("Normalized moments must be finite floating point")
         return moments.to(device=self.device)
 
-    def _transform_window(self, window, activation_checkpointing=False):
+    @contextmanager
+    def _short_adapter_mode(self, base_only):
+        saved = [(module, module.enabled) for _, module in _adapter_items(self.short_transformer)]
+        try:
+            for module, _ in saved:
+                module.enabled = not base_only
+            yield
+        finally:
+            for module, enabled in saved:
+                module.enabled = enabled
+
+    def _transform_window(self, window, activation_checkpointing=False, *, base_only=False):
         if self.short_transformer is None:
             raise ValueError("Only adapted_short transforms moment windows")
-        first = next(self.short_transformer.parameters())
+        # RMSNorm weights may remain FP32 in some model-loading variants; the
+        # attention projection, not that norm, defines Linear's input dtype.
+        first = self.short_transformer.blocks[0].attn.q_proj.base.weight
         if any(p.dtype != torch.float32 for p in self.short_parameters()):
             raise TypeError("Short LoRA parameters must remain FP32")
-        x = window.to(device=first.device, dtype=first.dtype)
+        # The cache's VLLN ran under CUDA autocast, producing FP32 values that
+        # were then saved as BF16. Both training and online delta computations
+        # intentionally use the SAME BF16-quantized input, promoted back to
+        # FP32 for that original CUDA autocast contract.
+        use_amp = first.device.type == "cuda" and first.dtype == torch.bfloat16
+        x = window.to(device=first.device, dtype=torch.bfloat16).float()
+        if not use_amp:
+            x = x.to(first.dtype)
         # Forward is deterministic. Gradient checkpointing saves the large
         # frozen Transformer intermediates while retaining gradients to LoRA.
         def forward(value):
-            # Match original evaluation's parameter/input compute dtype. Do
-            # not inherit an outer autocast that alters a CPU FP32 parity test.
-            with torch.autocast(device_type=value.device.type, enabled=False):
+            # Select base/adapted mode *inside* every invocation. Checkpoint
+            # recomputation cannot accidentally inherit a later toggled flag.
+            with self._short_adapter_mode(base_only), torch.autocast(
+                    device_type=value.device.type, dtype=torch.bfloat16, enabled=use_amp):
                 return self.short_transformer(value)[:, -self.config.num_short_tokens:]
-        if activation_checkpointing and torch.is_grad_enabled() and any(p.requires_grad for p in self.short_parameters()):
+        if activation_checkpointing and not base_only and torch.is_grad_enabled() and any(p.requires_grad for p in self.short_parameters()):
             return checkpoint(forward, x, use_reentrant=False, preserve_rng_state=False).float()
         return forward(x).float()
+
+    def _adapt_short(self, native_short, window, activation_checkpointing=False):
+        adapted = self._transform_window(window, activation_checkpointing)
+        with torch.no_grad():
+            reference = self._transform_window(window, base_only=True)
+        return native_short.to(device=adapted.device, dtype=torch.float32) + (adapted-reference)
 
     def encode_prefix(self, episode, count, *, activation_checkpointing=False):
         """Encode observations [0,count); no targets/actions/future values read.
 
-        B replays every causal K-window from the *normalized moment* cache.
+        B replays every causal K-window from the *normalized moment* cache,
+        then anchors its learned delta onto the supplied native short tokens.
         Left padding repeats observation zero, exactly like HAMLET's rolling
         inference. Absolute frame numbers are metadata, not window indices.
         All historical event computations remain connected to current weights.
@@ -244,9 +284,9 @@ class RepresentationMemoryV18(nn.Module):
                        + torch.arange(1-c.short_window, 1, device=moments.device)[None]).clamp_min(0)
             # Process a single window at a time: bounded peak activations and
             # exact batch-size-one online/cache arithmetic. No temporal detach.
-            shorts = torch.cat([self._transform_window(
+            shorts = torch.cat([self._adapt_short(episode["short"][index:index+1],
                 moments[row].reshape(1, c.short_window*c.num_short_tokens, c.feature_dim),
-                activation_checkpointing) for row in indices], dim=0)
+                activation_checkpointing) for index, row in enumerate(indices)], dim=0)
         else:
             shorts = episode["short"][:count].to(device=self.device, dtype=torch.float32)
         state = episode["state"][:count]
@@ -255,7 +295,7 @@ class RepresentationMemoryV18(nn.Module):
         if c.representation == "moment":
             if "moment" not in episode or len(episode["moment"]) < count:
                 raise ValueError("moment storage requires cached normalized moments")
-            stored = self.encode_event(self._moments(episode["moment"][:count]), state, frames, demo)
+            stored = self.encode_event(self._moments(episode["moment"][:count]).to(torch.bfloat16), state, frames, demo)
         else:
             stored = queries
         return {"short": shorts, "query": queries, "stored": stored}
@@ -340,9 +380,11 @@ class RepresentationMemoryV18(nn.Module):
                 if moment_history.shape != (batch, c.short_window*c.num_short_tokens, c.feature_dim):
                     raise ValueError("Online moment history has incompatible shape")
                 moment_history = torch.cat((moment_history.to(self.device)[:, c.num_short_tokens:], moments), dim=1)
-            short = self._transform_window(moment_history)
+            short = self._adapt_short(short, moment_history)
         encoded = self.encode_event(short, state, frames, is_demo)
-        stored = self.encode_event(self._moments(moment), state, frames, is_demo) if c.representation == "moment" else encoded
+        # C's offline source was stored as BF16. Match that quantization when
+        # online VLLN/autocast happens to expose an FP32 normalized moment.
+        stored = self.encode_event(self._moments(moment).to(torch.bfloat16), state, frames, is_demo) if c.representation == "moment" else encoded
         fused, metrics = self.read_from_bank(short, encoded, bank, read_enabled=read_enabled)
         if write_enabled:
             bank, write_metrics = self._write(bank, stored, write_policy=write_policy,

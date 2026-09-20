@@ -118,7 +118,7 @@ def make_write_policy(writer: StorageCVOMV18, capacity_events=None):
         insert = not full or score >= writer.config.threshold
         updated = fifo_insert(bank, candidate, capacity) if insert else bank
         return updated, {"writer_insert": float(insert), "writer_full": float(full),
-            "writer_score": score, "writer_keep": float(not insert)}
+            "writer_score": score, "writer_keep": float(not insert), "write_rate": float(insert)}
 
     return policy
 
@@ -180,7 +180,8 @@ def save_storage_writer_v18(path, writer, parent_checkpoint, *, step, metadata):
     return manifest
 
 
-def load_storage_writer_v18(path, parent_checkpoint, *, device="cpu"):
+def storage_writer_info_v18(path, parent_checkpoint):
+    """Read-only preflight validation without constructing even the small MLP."""
     from safetensors.torch import load_file
 
     path = Path(path).resolve(strict=True)
@@ -195,9 +196,23 @@ def load_storage_writer_v18(path, parent_checkpoint, *, device="cpu"):
     if file_sha256(path / "writer.safetensors") != manifest["writer_sha256"]:
         raise ValueError("Writer tensor file changed")
     config = WriterConfigV18(**manifest["config"])
-    writer = StorageCVOMV18(config)
     state = load_file(str(path / "writer.safetensors"))
     if any(value.dtype != torch.float32 or not bool(torch.isfinite(value).all()) for value in state.values()):
         raise ValueError("Writer tensors must be finite FP32")
+    width, hidden = 4 * config.memory_dim + 4, config.hidden_dim
+    shapes = {"network.0.weight": (width,), "network.0.bias": (width,),
+        "network.1.weight": (hidden, width), "network.1.bias": (hidden,),
+        "network.3.weight": (1, hidden), "network.3.bias": (1,)}
+    if {name: tuple(value.shape) for name, value in state.items()} != shapes:
+        raise ValueError("Writer tensor schema differs from configured MLP")
+    return config, manifest
+
+
+def load_storage_writer_v18(path, parent_checkpoint, *, device="cpu"):
+    from safetensors.torch import load_file
+
+    config, manifest = storage_writer_info_v18(path, parent_checkpoint)
+    writer = StorageCVOMV18(config)
+    state = load_file(str(Path(path) / "writer.safetensors"))
     writer.load_state_dict(state, strict=True)
     return writer.to(device).eval().requires_grad_(False), config, manifest

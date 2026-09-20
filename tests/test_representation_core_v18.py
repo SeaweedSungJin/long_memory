@@ -1,7 +1,6 @@
 """CPU-only V18 contracts: causality, source isolation, LoRA and replay parity."""
-from dataclasses import replace
-
-import pytest
+import inspect
+import unittest
 import torch
 
 from gr00t.model.modules.memory import MemoryTransformer
@@ -44,7 +43,6 @@ def run_online(core, ep, decision, **kwargs):
     return result
 
 
-@pytest.mark.parametrize("representation", ["short", "adapted_short", "moment"])
 def test_online_replay_parity_read_before_write_and_fifo(representation):
     core = RepresentationMemoryV18(config(representation=representation), transformer())
     live_fusion(core)
@@ -62,7 +60,6 @@ def test_online_replay_parity_read_before_write_and_fifo(representation):
     assert core.replay(ep, 0)["bank"].shape[1] == 0
 
 
-@pytest.mark.parametrize("representation", ["short", "adapted_short", "moment"])
 def test_no_future_or_action_access(representation):
     core = RepresentationMemoryV18(config(representation=representation), transformer())
     live_fusion(core)
@@ -89,7 +86,7 @@ def test_c_changes_only_stored_source_not_query():
     torch.testing.assert_close(a_encoded["short"], c_encoded["short"], rtol=0, atol=0)
     torch.testing.assert_close(a_encoded["query"], c_encoded["query"], rtol=0, atol=0)
     assert not torch.equal(a_encoded["stored"], c_encoded["stored"])
-    expected = c.encode_event(ep["moment"][:5], ep["state"][:5], ep["frames"][:5], ep["is_demo"][:5])
+    expected = c.encode_event(ep["moment"][:5].bfloat16(), ep["state"][:5], ep["frames"][:5], ep["is_demo"][:5])
     torch.testing.assert_close(c_encoded["stored"], expected, rtol=0, atol=0)
 
 
@@ -99,11 +96,14 @@ def test_zero_lora_parity_left_padding_and_base_unchanged():
     core = RepresentationMemoryV18(config(representation="adapted_short"), original)
     ep = episode()
     actual = core.encode_prefix(ep, 5)["short"]
-    expected = []
+    # Native short is authoritative, even when the normalized moment cache
+    # lost precision. At zero LoRA the anchored B must exactly reproduce A.
+    torch.testing.assert_close(actual, ep["short"][:5], rtol=0, atol=0)
     for index in range(5):
         ids = [max(0, j) for j in range(index-2, index+1)]
-        expected.append(original(ep["moment"][ids].reshape(1, 6, 16))[:, -2:])
-    torch.testing.assert_close(actual, torch.cat(expected), rtol=0, atol=0)
+        window = ep["moment"][ids].reshape(1, 6, 16)
+        native = original(window.bfloat16().float())[:, -2:]
+        torch.testing.assert_close(core._transform_window(window), native, rtol=0, atol=0)
     assert not set(map(id, core.parameters())) & set(map(id, original.parameters()))
     for name, value in original.state_dict().items():
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
@@ -125,7 +125,6 @@ def test_read_off_uses_same_adapted_short_and_has_short_gradient():
     assert result["metrics"]["read_norm"].item() == 0
 
 
-@pytest.mark.parametrize("representation", ["short", "adapted_short", "moment"])
 def test_historical_write_receives_gradient_without_future_detach(representation):
     core = RepresentationMemoryV18(config(representation=representation), transformer())
     live_fusion(core)
@@ -154,11 +153,11 @@ def test_delta_roundtrip_is_compact_strict_and_atomic():
     before = restored.delta_state_dict()
     bad = {name: value + 1 for name, value in delta.items()}
     bad[list(bad)[-1]] = torch.tensor([float("nan")])
-    with pytest.raises(ValueError):
+    with unittest.TestCase().assertRaises(ValueError):
         restored.load_delta_state_dict(bad)
     for name, value in before.items():
         torch.testing.assert_close(value, restored.delta_state_dict()[name], rtol=0, atol=0)
-    with pytest.raises(ValueError, match="keys differ"):
+    with unittest.TestCase().assertRaisesRegex(ValueError, "keys differ"):
         restored.load_delta_state_dict({})
 
 
@@ -195,18 +194,18 @@ def test_callback_sees_only_past_and_respects_current_observation():
 
 
 def test_validation_and_frozen_unused_parameters():
-    with pytest.raises(ValueError):
+    with unittest.TestCase().assertRaises(ValueError):
         RepresentationConfigV18(capacity_events=True)
-    with pytest.raises(ValueError):
+    with unittest.TestCase().assertRaises(ValueError):
         RepresentationMemoryV18(config(representation="adapted_short"))
     core = RepresentationMemoryV18(config())
     trainable = {name for name, p in core.named_parameters() if p.requires_grad}
     assert not any("write_" in name or "slot_addresses" in name or "update_gate" in name for name in trainable)
-    with pytest.raises(ValueError):
+    with unittest.TestCase().assertRaises(ValueError):
         core.write_fifo(torch.zeros(1, 8, 8), torch.zeros(1, 2, 8))
     invalid = episode()
     invalid["frames"][2] = 0
-    with pytest.raises(ValueError, match="increasing"):
+    with unittest.TestCase().assertRaisesRegex(ValueError, "increasing"):
         core.replay(invalid, 3)
 
 
@@ -220,3 +219,43 @@ def test_mlp_gate_keeps_empty_and_off_exact_identity():
     disabled = core.replay(ep, 4, read_enabled=False)
     torch.testing.assert_close(empty["fused"], ep["short"][:1], rtol=0, atol=0)
     torch.testing.assert_close(disabled["fused"], ep["short"][4:5], rtol=0, atol=0)
+
+
+def test_anchored_short_nonzero_delta_online_replay_and_checkpoint_gradients():
+    core = RepresentationMemoryV18(config(representation="adapted_short"), transformer())
+    live_fusion(core)
+    with torch.no_grad():
+        for parameter in core.short_parameters():
+            parameter.add_(0.025)
+    ep = episode()
+    replay = core.replay(ep, 4, activation_checkpointing=True)
+    online = run_online(core, ep, 4)
+    torch.testing.assert_close(replay["fused"], online["fused"], rtol=2e-6, atol=1e-6)
+    torch.testing.assert_close(replay["short"], online["short"], rtol=0, atol=0)
+    assert not torch.equal(replay["short"], ep["short"][4:5])
+    # Intervening native-only forward cannot alter how backward recomputes
+    # previously checkpointed adapted forwards.
+    window = ep["moment"][2:5].reshape(1, 6, 16)
+    core._transform_window(window, base_only=True)
+    replay["fused"].square().mean().backward()
+    assert all(p.grad is not None for p in core.short_parameters())
+    assert any(p.grad.abs().sum() > 0 for p in core.short_parameters())
+    assert all(module.enabled for module in core.short_transformer.modules() if hasattr(module, "enabled"))
+
+
+def load_tests(loader, tests, pattern):
+    """Run the source matrix using stdlib unittest; pytest is not required."""
+    suite = unittest.TestSuite()
+    for name, function in sorted(globals().items()):
+        if name.startswith("test_") and callable(function):
+            variants = ("short", "adapted_short", "moment") if "representation" in inspect.signature(function).parameters else (None,)
+            for variant in variants:
+                def invoke(function=function, variant=variant):
+                    torch.set_num_threads(1)
+                    function(variant) if variant is not None else function()
+                suite.addTest(unittest.FunctionTestCase(invoke, description=f"{name}[{variant or 'common'}]"))
+    return suite
+
+
+if __name__ == "__main__":
+    unittest.main()

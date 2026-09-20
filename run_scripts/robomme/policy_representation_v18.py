@@ -24,10 +24,13 @@ class RepresentationSession(_Session):
     moment_history: torch.Tensor | None = None
     observations: int = 0
     demo_updates: int = 0
+    updates: int = 0
+    keeps: int = 0
+    demo_keeps: int = 0
 
 
 class RepresentationPolicyV18(LongMemoryPolicy):
-    def __init__(self, base_model, checkpoint, device="cuda:0", memory_off=False, strict=True):
+    def __init__(self, base_model, checkpoint, device="cuda:0", memory_off=False, strict=True, writer_checkpoint=None):
         if type(memory_off) is not bool:
             raise TypeError("memory_off must be boolean")
         info = checkpoint_info_v18(base_model, checkpoint)
@@ -42,11 +45,25 @@ class RepresentationPolicyV18(LongMemoryPolicy):
         load_checkpoint_v18(checkpoint, self.representation, head)
         set_expert_trainable(head, False)
         head.eval().requires_grad_(False)
-        self.representation.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
+        # Keep the copied HAMLET transformer's original BF16 precision. The
+        # portable reader/LoRA deltas are already FP32; casting the WHOLE module
+        # would silently change B's frozen short computation versus training.
+        self.representation.to(device=device).eval().requires_grad_(False)
         self.memory_off = memory_off
         self.stage, self.mode, self.write_policy = 1, "representation_v18", "fifo"
         self.checkpoint_step = info["step"]
         self.payload_sha256 = info["metadata"]["payload_sha256"]
+        self.writer = self.writer_callback = None
+        self.writer_sha256 = None
+        if writer_checkpoint is not None:
+            from run_scripts.robomme.storage_cvom_v18 import load_storage_writer_v18, make_write_policy
+            self.writer, writer_cfg, writer_manifest = load_storage_writer_v18(writer_checkpoint, checkpoint, device=device)
+            if (writer_cfg.capacity_events != self.representation.config.capacity_events
+                    or writer_cfg.memory_dim != self.representation.config.hidden_dim):
+                raise ValueError("Writer reader capacity/dimension differs")
+            self.writer_callback = make_write_policy(self.writer)
+            self.writer_sha256 = writer_manifest["writer_sha256"]
+            self.write_policy = "cvom"
         rcfg = self.representation.config
         if (rcfg.num_short_tokens != self.n_q or rcfg.short_window != self.model.config.memory_window
                 or rcfg.state_dim != self.processor.max_state_dim):
@@ -120,6 +137,7 @@ class RepresentationPolicyV18(LongMemoryPolicy):
                     torch.tensor([passive], dtype=torch.bool, device=self.model.device),
                     bank=session.long_bank, moment_history=session.moment_history,
                     read_enabled=enabled, write_enabled=True,
+                    write_policy=self.writer_callback, event_index=session.observations,
                 )
             cast = result["fused"].to(frozen_short.dtype)
             adapted_short = result["short"].to(frozen_short.dtype)
@@ -140,13 +158,17 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             session.long_bank = result["bank"].detach()
             session.moment_history = result["moment_history"].detach() if result["moment_history"] is not None else None
             session.observations += 1
-            session.demo_updates += int(passive)
+            inserted = metrics.get("writer_insert", metrics.get("write_rate", 1.0)) == 1.0
+            session.updates += int(inserted)
+            session.keeps += int(not inserted)
+            session.demo_updates += int(passive and inserted)
+            session.demo_keeps += int(passive and not inserted)
             diagnostics = {
-                "policy": "fifo", "mode": self.mode, "memory_read_enabled": enabled,
+                "policy": self.write_policy, "mode": self.mode, "memory_read_enabled": enabled,
                 "frame_index": frame, "passive": passive, "observations_seen": session.observations,
                 "memory_tokens": int(session.long_bank.shape[1]),
-                "write_attempts": session.observations, "updates": session.observations, "keeps": 0,
-                "demo_updates": session.demo_updates, "demo_keeps": 0, "read": metrics,
+                "write_attempts": session.observations, "updates": session.updates, "keeps": session.keeps,
+                "demo_updates": session.demo_updates, "demo_keeps": session.demo_keeps, "read": metrics,
             }
             session.short_cache = head._memory_cache.detach().clone()
             session.raw_states = {key: np.array(value, copy=True) for key, value in step.states.items()}
@@ -170,4 +192,5 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             "expert_adapted": True, "checkpoint_variant": "representation_v18",
             "checkpoint_step": self.checkpoint_step, "memory_off": self.memory_off,
             "representation": self.representation.config.representation,
+            "writer_sha256": self.writer_sha256,
             "payload_sha256": self.payload_sha256}

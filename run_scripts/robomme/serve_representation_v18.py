@@ -13,6 +13,7 @@ def build_parser():
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--memory-off", action="store_true")
+    parser.add_argument("--writer-checkpoint")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
@@ -26,7 +27,8 @@ def main(argv=None):
     from run_scripts.robomme.policy_representation_v18 import RepresentationPolicyV18
     from gr00t.policy.gr00t_policy import Gr00tSimPolicyWrapper
     from gr00t.policy.server_client import PolicyServer
-    policy = RepresentationPolicyV18(args.base_model, args.checkpoint, args.device, args.memory_off)
+    policy = RepresentationPolicyV18(args.base_model, args.checkpoint, args.device, args.memory_off,
+                                    writer_checkpoint=args.writer_checkpoint)
     print(f"[v18] representation={policy.representation.config.representation}; read_off={policy.memory_off}; step={policy.checkpoint_step}", flush=True)
     server = None
     try:
