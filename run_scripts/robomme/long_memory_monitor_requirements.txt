@@ -1,0 +1,3 @@
+# Optional local dashboard only; no TensorFlow, W&B account, or training change.
+# 2.21 fixes the pkg_resources dependency incompatible with newer setuptools.
+tensorboard==2.21.0
