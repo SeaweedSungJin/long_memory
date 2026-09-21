@@ -32,6 +32,7 @@ from gr00t.eval.sim.robomme.compare_long_memory_v3_results import _contrast
 from gr00t.long_memory.safety_v5 import validate_output_scope
 from run_scripts.robomme.baseline_reference_v18 import build_reference, validate_reference
 from run_scripts.robomme.report_baseline_reference_v10 import build_reference_report
+from run_scripts.robomme.feature_precision_v19 import feature_precision_contract
 
 VARIANT = "representation_v18"
 BASELINE_SERVER = "run_scripts/robomme/serve_archive_projector_v10.py"
@@ -44,6 +45,11 @@ DEPENDENCIES = (
     "baseline_reference_v10.py", "report_baseline_reference_v10.py", "eval_long_memory_comparison.py",
     "policy_archive_projector_v10.py", "checkpoint_projector_v10.py", "projector_adapter_v10.py",
     "storage_cvom_v18.py",
+    "feature_precision_v19.py",
+)
+SEMANTIC_DEPENDENCIES = (
+    "semantic_memory_checkpoint.py", "semantic_memory_storage.py",
+    "eval_semantic_memory.py",
 )
 
 
@@ -52,6 +58,8 @@ def build_parser():
     p.add_argument("--base-model", type=Path, default=Path("checkpoints/author_hamlet_robomme/checkpoint-60000"))
     p.add_argument("--checkpoint", type=Path, help="One genuine V18 bundle, shared by every candidate role")
     p.add_argument("--writer-checkpoint", type=Path, help="Optional CVOM sidecar bound to this exact reader checkpoint")
+    p.add_argument("--semantic-memory", action="store_true",
+        help="Validate/load semantic.json extras; Stage-2 manager replaces legacy writer (never both)")
     p.add_argument("--baseline-reference", type=Path, help="Completed ORIGINAL run containing comparison_manifest.json; never a copied CSV")
     p.add_argument("--models", nargs="+", choices=ROLES, default=["baseline", "memory"])
     p.add_argument("--tasks", nargs="+", default=["all"])
@@ -65,6 +73,8 @@ def build_parser():
     p.add_argument("--server-python", type=Path, default=REPO_ROOT / ".venv/bin/python")
     p.add_argument("--robomme-python", type=Path, default=Path("/home/sjkim/robomme_benchmark/.venv/bin/python"))
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--feature-precision", choices=("native", "cache-aligned"), default="native",
+        help="Candidate feature extraction only; original HAMLET baseline and AE generation stay native")
     p.add_argument("--server-timeout", type=float, default=300)
     p.add_argument("--task-timeout", type=float, default=0)
     p.add_argument("--allow-initialization-checkpoints", action="store_true")
@@ -86,7 +96,12 @@ def validate_options(args):
         raise ValueError("Candidate roles require --checkpoint")
     if args.writer_checkpoint is not None and args.checkpoint is None:
         raise ValueError("A writer requires its --checkpoint reader")
-    if "fifo" in args.models and args.writer_checkpoint is None:
+    semantic = getattr(args, "semantic_memory", False)
+    if semantic and (args.writer_checkpoint is not None or args.checkpoint is None):
+        raise ValueError("Semantic memory requires --checkpoint and cannot use legacy --writer-checkpoint")
+    if semantic and args.feature_precision != "native":
+        raise ValueError("Semantic-memory comparison preserves native feature precision")
+    if "fifo" in args.models and args.writer_checkpoint is None and not semantic:
         raise ValueError("fifo is a same-capacity CVOM control; supply --writer-checkpoint")
     if not 1 <= args.n_episodes <= (100 if args.dataset == "train" else 50) or args.seed < 0:
         raise ValueError("Invalid episode count or seed")
@@ -100,6 +115,45 @@ def validate_options(args):
 
 def identity_digest(identity):
     return hashlib.sha256(json.dumps({k: v for k, v in identity.items() if k != "evaluation_id"}, sort_keys=True).encode()).hexdigest()
+
+
+def validate_semantic_model(model):
+    """Validate the additive sidecar contract; never relax original V18 checks."""
+    block = model.get("semantic_memory")
+    if not isinstance(block, dict) or set(block) != {"manifest", "files_sha256"}:
+        raise ValueError("Incomplete semantic-memory provenance")
+    manifest, hashes = block["manifest"], block["files_sha256"]
+    if (not isinstance(manifest, dict) or manifest.get("variant") != "semantic_memory_v1"
+            or manifest.get("format_version") != 1 or type(manifest.get("stage")) is not int
+            or manifest["stage"] not in (1, 2)):
+        raise ValueError("Unsupported semantic stage/manifest")
+    if manifest.get("metadata", {}).get("labels_at_inference") is not False:
+        raise ValueError("Semantic labels may only be training targets")
+    if manifest.get("actor_payload_sha256") != model.get("training_metadata", {}).get("payload_sha256"):
+        raise ValueError("Semantic sidecar belongs to another actor")
+    storage = manifest.get("storage_config")
+    if manifest["stage"] == 1 and storage is not None:
+        raise ValueError("Semantic Stage 1 must use FIFO")
+    payloads = {"answers.safetensors"} | ({"storage.safetensors"} if storage is not None else set())
+    if set(manifest.get("payload_sha256", {})) != payloads or set(hashes) != payloads | {"semantic.json"}:
+        raise ValueError("Incomplete semantic payload hashes")
+    if any(hashes.get(name) != digest for name, digest in manifest["payload_sha256"].items()):
+        raise ValueError("Semantic payload hash mismatch")
+    if any(not isinstance(digest, str) or len(digest) != 64
+           or any(c not in "0123456789abcdef" for c in digest) for digest in hashes.values()):
+        raise ValueError("Malformed semantic payload hash")
+    if model.get("writer_checkpoint") is not None:
+        raise ValueError("Semantic manager and legacy writer are mutually exclusive")
+    if storage is not None:
+        from run_scripts.robomme.semantic_memory_storage import StorageConfig
+        cfg = StorageConfig(**storage)
+        rcfg = model["representation_config"]
+        if (cfg.capacity_events != rcfg["capacity_events"] or cfg.num_tokens != rcfg["num_short_tokens"]
+                or cfg.dim != rcfg["hidden_dim"]):
+            raise ValueError("Semantic storage and representation dimensions differ")
+    if model.get("feature_precision") != "native" or model.get("feature_precision_rules") != feature_precision_contract("native"):
+        raise ValueError("Semantic memory requires the unchanged native precision contract")
+    return storage is not None
 
 
 def validate_manifest_contract(identity):
@@ -117,8 +171,10 @@ def validate_manifest_contract(identity):
             if (model.get("mode") != "none" or model.get("stage", 0) != 0 or model.get("memory_checkpoint") is not None
                     or model.get("write_policy") != "none" or model.get("write_policy_override") != "checkpoint"
                     or model.get("server_script") != BASELINE_SERVER
-                    or any(key in model for key in ("checkpoint_files_sha256", "representation_config", "writer_checkpoint"))):
+                    or any(key in model for key in ("checkpoint_files_sha256", "representation_config", "writer_checkpoint", "semantic_memory"))):
                 raise ValueError("Baseline must be ORIGINAL HAMLET without adapters")
+            if model.get("feature_precision", "native") != "native" or "feature_precision_rules" in model:
+                raise ValueError("Original baseline precision must remain native")
         else:
             if (model.get("mode") != VARIANT or model.get("server_script") != SERVER
                     or not model.get("memory_checkpoint") or type(model.get("step")) is not int
@@ -127,8 +183,24 @@ def validate_manifest_contract(identity):
             hashes = model.get("checkpoint_files_sha256", {})
             if set(hashes) != {"checkpoint.json", "model.safetensors", "expert.safetensors"}:
                 raise ValueError("Incomplete candidate payload provenance")
-            if model.get("write_policy") != ("cvom" if model.get("writer_checkpoint") and role != "fifo" else "fifo"):
+            if "semantic_memory" in model:
+                has_storage = validate_semantic_model(model)
+                if (model["semantic_memory"]["manifest"]["metadata"].get("smoke_only") is True
+                        and not identity.get("allow_initialization_checkpoints")):
+                    raise ValueError("Smoke-only semantic checkpoint is a pipeline check, not a trained performance candidate")
+                if role == "fifo" and not has_storage:
+                    raise ValueError("Semantic FIFO ablation requires a checkpoint with a learned manager")
+                expected_policy = "semantic-cvom" if has_storage and role != "fifo" else "fifo"
+            else:
+                expected_policy = "cvom" if model.get("writer_checkpoint") and role != "fifo" else "fifo"
+            if model.get("write_policy") != expected_policy:
                 raise ValueError("Writer role disagrees with checkpoint")
+            # Old native manifests predate this explicit option. Do not rewrite
+            # them; newly recorded values must have the exact reviewed contract.
+            if "feature_precision" in model or "feature_precision_rules" in model:
+                precision = model.get("feature_precision")
+                if precision not in ("native", "cache-aligned") or model.get("feature_precision_rules") != feature_precision_contract(precision):
+                    raise ValueError("Candidate feature precision rules are missing or changed")
     if {"memory", "memory-off"} <= set(models):
         ignored = {"description", "memory_off"}
         if {k: v for k, v in models["memory"].items() if k not in ignored} != {k: v for k, v in models["memory-off"].items() if k not in ignored}:
@@ -163,9 +235,26 @@ def build_identity(args):
             "step": info["step"], "server_script": SERVER, "write_policy_override": "checkpoint",
             "archive_read_off": False, "representation_config": info["config"]["representation"],
             "training_config": info["config"], "training_metadata": info["metadata"],
+            "feature_precision": args.feature_precision,
+            "feature_precision_rules": feature_precision_contract(args.feature_precision),
             "checkpoint_files_sha256": {name: file_hash(checkpoint / name) for name in
                 ("checkpoint.json", "model.safetensors", "expert.safetensors")}}
         inputs.append(checkpoint)
+        semantic = None
+        if getattr(args, "semantic_memory", False):
+            from run_scripts.robomme.semantic_memory_checkpoint import semantic_info
+            semantic = semantic_info(checkpoint)
+            if semantic["metadata"].get("smoke_only") is True:
+                if not args.allow_initialization_checkpoints:
+                    raise ValueError("Smoke-only semantic checkpoint: explicitly opt into --allow-initialization-checkpoints for a pipeline check")
+                print("[preflight] WARNING: smoke-only checkpoint; diagnostic execution is NOT a trained performance result", flush=True)
+            if "fifo" in args.models and semantic["storage_config"] is None:
+                raise ValueError("Semantic FIFO role requires a checkpoint containing a storage manager")
+            common["semantic_memory"] = {"manifest": semantic,
+                "files_sha256": {name: file_hash(checkpoint / name)
+                    for name in ("semantic.json", *sorted(semantic["payload_sha256"]))}}
+        elif (checkpoint / "semantic.json").exists():
+            raise ValueError("This checkpoint has semantic extras; pass --semantic-memory instead of silently ignoring them")
         cache = info["config"].get("train", {}).get("cache_dir")
         if cache:
             inputs.append(resolve_repo_path(Path(cache)))
@@ -184,7 +273,8 @@ def build_identity(args):
                 continue
             model = copy.deepcopy(common)
             model.update(memory_off=role == "memory-off",
-                write_policy="cvom" if args.writer_checkpoint and role != "fifo" else "fifo",
+                write_policy=("semantic-cvom" if semantic and semantic["storage_config"] is not None and role != "fifo"
+                    else "cvom" if args.writer_checkpoint and role != "fifo" else "fifo"),
                 description="SAME adapted short/AE, long READ bypassed" if role == "memory-off" else "V18 learned READ/fusion")
             models[role] = model
     if args.baseline_reference:
@@ -192,6 +282,8 @@ def build_identity(args):
     validate_output_scope(resolve_repo_path(args.output_dir), *inputs)
     sources = {p.relative_to(REPO_ROOT) for p in (REPO_ROOT / "gr00t").rglob("*.py")}
     sources.update(Path("run_scripts/robomme") / name for name in DEPENDENCIES)
+    if getattr(args, "semantic_memory", False):
+        sources.update(Path("run_scripts/robomme") / name for name in SEMANTIC_DEPENDENCIES)
     sources.add(Path(BASELINE_SERVER))
     print("[preflight] hashing immutable original HAMLET, candidate and source provenance ...", flush=True)
     identity = {"format_version": 1, "trainer_variant": VARIANT, "models": models,
@@ -220,10 +312,15 @@ def server_command(args, model, port):
         "--base-model", model["base_model"]["path"], "--device", args.device, "--host", "127.0.0.1", "--port", str(port)]
     if model["memory_checkpoint"]:
         command += ["--checkpoint", model["memory_checkpoint"]]
+        command += ["--feature-precision", model.get("feature_precision", "native")]
         if model["memory_off"]:
             command.append("--memory-off")
         if model.get("writer_checkpoint") and model["write_policy"] == "cvom":
             command += ["--writer-checkpoint", model["writer_checkpoint"]]
+        if "semantic_memory" in model:
+            command.append("--semantic-memory")
+            if model["write_policy"] == "fifo" and model["semantic_memory"]["manifest"]["storage_config"] is not None:
+                command.append("--semantic-fifo")
     return command
 
 
@@ -236,6 +333,9 @@ def verify_runtime_inputs(identity):
             files.update({Path(model["memory_checkpoint"]) / path: digest for path, digest in model["checkpoint_files_sha256"].items()})
         if model.get("writer_checkpoint"):
             files.update({Path(model["writer_checkpoint"]) / path: digest for path, digest in model["writer_files_sha256"].items()})
+        if "semantic_memory" in model:
+            files.update({Path(model["memory_checkpoint"]) / path: digest
+                for path, digest in model["semantic_memory"]["files_sha256"].items()})
     for path, digest in files.items():
         if file_hash(path) != digest:
             raise ValueError(f"Bound inference file changed: {path}")
@@ -279,6 +379,17 @@ def completed_read_diagnostics(root, role, manifest):
                     "representation": model["representation_config"]["representation"], "memory_off": role == "memory-off",
                     "payload_sha256": model["training_metadata"]["payload_sha256"],
                     "writer_sha256": model.get("writer_manifest", {}).get("writer_sha256") if model["write_policy"] == "cvom" else None}
+                if "semantic_memory" in model:
+                    semantic = model["semantic_memory"]
+                    storage_hash = semantic["manifest"]["payload_sha256"].get("storage.safetensors")
+                    expected.update(semantic_manifest_sha256=semantic["files_sha256"]["semantic.json"],
+                        semantic_payload_sha256=semantic["manifest"]["payload_sha256"],
+                        semantic_stage=semantic["manifest"]["stage"],
+                        storage_manager_sha256=storage_hash,
+                        writer_sha256=storage_hash if model["write_policy"] == "semantic-cvom" else None)
+                if "feature_precision" in model:
+                    expected["feature_precision"] = model["feature_precision"]
+                    expected["feature_precision_rules"] = model["feature_precision_rules"]
                 if not set(expected) <= set(info):
                     totals["missing_identity"] += 1
                 for key, value in expected.items():

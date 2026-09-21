@@ -176,3 +176,7 @@ offline_open_loop_eval_plots/
 
 /checkpoints
 /docs
+
+# Diagnostic source files are not runtime logs (the broad *logs* rule above).
+!/run_scripts/robomme/diagnose_v19_logs.py
+!/tests/test_diagnose_v19_logs.py

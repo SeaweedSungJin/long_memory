@@ -16,6 +16,9 @@ from gr00t.long_memory.online_policy_v7 import _scalar_metrics
 from gr00t.long_memory.expert_v4 import LoRAConfig, install_expert_lora, set_expert_trainable
 from run_scripts.robomme.checkpoint_representation_v18 import checkpoint_info_v18, load_checkpoint_v18
 from run_scripts.robomme.representation_core_v18 import RepresentationConfigV18, RepresentationMemoryV18
+from run_scripts.robomme.feature_precision_v19 import (
+    extract_hamlet_features, feature_precision_contract, validate_feature_precision,
+)
 
 
 @dataclass
@@ -30,9 +33,18 @@ class RepresentationSession(_Session):
 
 
 class RepresentationPolicyV18(LongMemoryPolicy):
-    def __init__(self, base_model, checkpoint, device="cuda:0", memory_off=False, strict=True, writer_checkpoint=None):
+    def __init__(self, base_model, checkpoint, device="cuda:0", memory_off=False, strict=True, writer_checkpoint=None,
+                 feature_precision="native", semantic_memory=False, semantic_fifo=False):
         if type(memory_off) is not bool:
             raise TypeError("memory_off must be boolean")
+        if type(semantic_memory) is not bool or type(semantic_fifo) is not bool:
+            raise TypeError("semantic_memory/semantic_fifo must be boolean")
+        if semantic_fifo and not semantic_memory:
+            raise ValueError("semantic_fifo requires semantic_memory")
+        if semantic_memory and (writer_checkpoint is not None or feature_precision != "native"):
+            raise ValueError("Semantic memory requires native precision and no legacy writer")
+        self.feature_precision = validate_feature_precision(feature_precision)
+        self.feature_precision_rules = feature_precision_contract(self.feature_precision)
         info = checkpoint_info_v18(base_model, checkpoint)
         super().__init__(base_model, memory_checkpoint=None, device=device, strict=strict)
         cfg = info["config"]
@@ -55,6 +67,24 @@ class RepresentationPolicyV18(LongMemoryPolicy):
         self.payload_sha256 = info["metadata"]["payload_sha256"]
         self.writer = self.writer_callback = None
         self.writer_sha256 = None
+        self.semantic_memory = semantic_memory
+        if semantic_memory:
+            from pathlib import Path
+            from run_scripts.robomme.semantic_memory_checkpoint import load_manager
+            from run_scripts.robomme.train_archive_deployment_v9 import file_hash
+            # New sidecar construction must not consume subsequent action RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.writer, semantic = load_manager(checkpoint, device=device)
+            self.stage = semantic["stage"]
+            self.semantic_manifest_sha256 = file_hash(Path(checkpoint) / "semantic.json")
+            self.semantic_payload_sha256 = semantic["payload_sha256"]
+            self.storage_manager_sha256 = semantic["payload_sha256"].get("storage.safetensors")
+            if semantic_fifo and self.writer is None:
+                raise ValueError("Semantic FIFO control requires a checkpoint with a manager")
+            if self.writer is not None and not semantic_fifo:
+                self.writer_callback = self.writer.make_policy()
+                self.writer_sha256 = self.storage_manager_sha256
+                self.write_policy = "semantic-cvom"
         if writer_checkpoint is not None:
             from run_scripts.robomme.storage_cvom_v18 import load_storage_writer_v18, make_write_policy
             self.writer, writer_cfg, writer_manifest = load_storage_writer_v18(writer_checkpoint, checkpoint, device=device)
@@ -121,12 +151,12 @@ class RepresentationPolicyV18(LongMemoryPolicy):
         head._memory_cache, head._vision_cache, head._inference_gen = session.short_cache, None, session.generator
         try:
             backbone_inputs, action_inputs = self.model.prepare_input(batch)
-            raw_backbone = self.model.backbone(backbone_inputs)
-            # Cache.py stores precisely this PRE-HAMLET, already normalized tail.
-            # Calling VLLN here does not mutate raw_backbone; process_backbone_output
-            # independently normalizes its original input exactly once.
-            moment = head.vlln(raw_backbone["backbone_features"])[:, -self.n_q:].float()
-            backbone = head.process_backbone_output(raw_backbone, action_inputs_B=1)
+            # The precision option is scoped to feature extraction and its
+            # cache boundary only. AE state encoding and denoising below keep
+            # their original execution precision and session RNG behavior.
+            backbone, moment = extract_hamlet_features(
+                self.model, head, backbone_inputs, self.n_q, self.feature_precision,
+            )
             features = backbone["backbone_features"]
             frozen_short = features[:, -self.n_q:]
             enabled = not self.memory_off and not prime and session.observations > 0
@@ -188,9 +218,16 @@ class RepresentationPolicyV18(LongMemoryPolicy):
         except Exception:
             self.sessions.pop(ids[0], None)
             raise
-        return actions, {"long_memory": diagnostics, "stage": self.stage, "episode_seed": seed,
+        info = {"long_memory": diagnostics, "stage": self.stage, "episode_seed": seed,
             "expert_adapted": True, "checkpoint_variant": "representation_v18",
             "checkpoint_step": self.checkpoint_step, "memory_off": self.memory_off,
             "representation": self.representation.config.representation,
+            "feature_precision": self.feature_precision,
+            "feature_precision_rules": self.feature_precision_rules,
             "writer_sha256": self.writer_sha256,
             "payload_sha256": self.payload_sha256}
+        if getattr(self, "semantic_memory", False):
+            info.update(semantic_manifest_sha256=self.semantic_manifest_sha256,
+                semantic_payload_sha256=self.semantic_payload_sha256,
+                semantic_stage=self.stage, storage_manager_sha256=self.storage_manager_sha256)
+        return actions, info

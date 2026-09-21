@@ -202,6 +202,10 @@ def test_online_off_preserves_adapted_short_and_captures_pre_hamlet_moment():
                 "metrics": {"write_rate": torch.tensor(1.)}, "bank": torch.zeros(1, 4, 8), "moment_history": None}
 
     p = RepresentationPolicyV18.__new__(RepresentationPolicyV18)
+    # This fixture bypasses __init__; supply its explicit native contract.
+    from run_scripts.robomme.feature_precision_v19 import feature_precision_contract
+    p.feature_precision = "native"
+    p.feature_precision_rules = feature_precision_contract("native")
     p.sessions, p.session_cap = OrderedDict(), 4
     head = Head()
     p.model = SimpleNamespace(device=torch.device("cpu"), action_head=head,
