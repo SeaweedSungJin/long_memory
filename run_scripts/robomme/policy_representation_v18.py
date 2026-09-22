@@ -7,6 +7,7 @@ READ-off retains that adapted short representation and the same adapted AE.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -21,6 +22,13 @@ from run_scripts.robomme.feature_precision_v19 import (
 )
 
 
+CVOM_RUNTIME_SOURCES = (
+    "cvom_admission_core.py", "cvom_admission_checkpoint.py", "policy_representation_v18.py",
+    "serve_representation_v18.py", "representation_core_v18.py", "checkpoint_representation_v18.py",
+    "feature_precision_v19.py",
+)
+
+
 @dataclass
 class RepresentationSession(_Session):
     long_bank: torch.Tensor | None = None
@@ -30,11 +38,16 @@ class RepresentationSession(_Session):
     updates: int = 0
     keeps: int = 0
     demo_keeps: int = 0
+    appends: int = 0
+    replacements: int = 0
+    demo_appends: int = 0
+    demo_replacements: int = 0
 
 
 class RepresentationPolicyV18(LongMemoryPolicy):
     def __init__(self, base_model, checkpoint, device="cuda:0", memory_off=False, strict=True, writer_checkpoint=None,
-                 feature_precision="native", semantic_memory=False, semantic_fifo=False):
+                 feature_precision="native", semantic_memory=False, semantic_fifo=False,
+                 cvom_admission=False, cvom_fifo=False):
         if type(memory_off) is not bool:
             raise TypeError("memory_off must be boolean")
         if type(semantic_memory) is not bool or type(semantic_fifo) is not bool:
@@ -43,6 +56,12 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             raise ValueError("semantic_fifo requires semantic_memory")
         if semantic_memory and (writer_checkpoint is not None or feature_precision != "native"):
             raise ValueError("Semantic memory requires native precision and no legacy writer")
+        if type(cvom_admission) is not bool or type(cvom_fifo) is not bool:
+            raise TypeError("cvom_admission/cvom_fifo must be boolean")
+        if cvom_fifo and not cvom_admission:
+            raise ValueError("cvom_fifo requires cvom_admission")
+        if cvom_admission and (writer_checkpoint is None or semantic_memory or feature_precision != "native"):
+            raise ValueError("CVoM admission requires a writer checkpoint, native precision, and no semantic manager")
         self.feature_precision = validate_feature_precision(feature_precision)
         self.feature_precision_rules = feature_precision_contract(self.feature_precision)
         info = checkpoint_info_v18(base_model, checkpoint)
@@ -67,9 +86,9 @@ class RepresentationPolicyV18(LongMemoryPolicy):
         self.payload_sha256 = info["metadata"]["payload_sha256"]
         self.writer = self.writer_callback = None
         self.writer_sha256 = None
+        self.cvom_admission = cvom_admission
         self.semantic_memory = semantic_memory
         if semantic_memory:
-            from pathlib import Path
             from run_scripts.robomme.semantic_memory_checkpoint import load_manager
             from run_scripts.robomme.train_archive_deployment_v9 import file_hash
             # New sidecar construction must not consume subsequent action RNG.
@@ -85,7 +104,28 @@ class RepresentationPolicyV18(LongMemoryPolicy):
                 self.writer_callback = self.writer.make_policy()
                 self.writer_sha256 = self.storage_manager_sha256
                 self.write_policy = "semantic-cvom"
-        if writer_checkpoint is not None:
+        if cvom_admission:
+            from run_scripts.robomme.cvom_admission_checkpoint import load_controller
+            from run_scripts.robomme.train_archive_deployment_v9 import file_hash
+            # Sidecar initialization must not advance the actor's action RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.writer, admission = load_controller(
+                    writer_checkpoint, checkpoint, device=device, base_model=base_model)
+            writer_cfg = admission["config"]
+            rcfg = self.representation.config
+            if (writer_cfg["capacity_events"] != rcfg.capacity_events or rcfg.capacity_events != 32
+                    or writer_cfg["dim"] != rcfg.hidden_dim or writer_cfg["num_tokens"] != rcfg.num_short_tokens):
+                raise ValueError("CVoM writer must match the parent's 32-event reader dimensions")
+            self.cvom_manifest_sha256 = admission["manifest_sha256"]
+            self.cvom_writer_sha256 = admission["writer_sha256"]
+            self.cvom_parent_identity = admission["parent_identity"]
+            source_root = Path(__file__).resolve().parent
+            self.cvom_source_sha256 = {name: file_hash(source_root / name) for name in CVOM_RUNTIME_SOURCES}
+            if not cvom_fifo:
+                self.writer_callback = self.writer.make_policy()
+                self.writer_sha256 = self.cvom_writer_sha256
+                self.write_policy = "cvom-admission"
+        elif writer_checkpoint is not None:
             from run_scripts.robomme.storage_cvom_v18 import load_storage_writer_v18, make_write_policy
             self.writer, writer_cfg, writer_manifest = load_storage_writer_v18(writer_checkpoint, checkpoint, device=device)
             if (writer_cfg.capacity_events != self.representation.config.capacity_events
@@ -160,6 +200,7 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             features = backbone["backbone_features"]
             frozen_short = features[:, -self.n_q:]
             enabled = not self.memory_off and not prime and session.observations > 0
+            previous_events = 0 if session.long_bank is None else session.long_bank.shape[1] // self.n_q
             with torch.autocast(device_type=self.model.device.type, enabled=False):
                 result = self.representation.step(
                     frozen_short.float(), moment, state,
@@ -193,6 +234,23 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             session.keeps += int(not inserted)
             session.demo_updates += int(passive and inserted)
             session.demo_keeps += int(passive and not inserted)
+            if getattr(self, "cvom_admission", False):
+                capacity = self.representation.config.capacity_events
+                append = inserted and previous_events < capacity
+                replace = inserted and previous_events == capacity
+                expected = {"writer_append": float(append), "writer_replace": float(replace),
+                            "writer_keep": float(not inserted), "writer_insert": float(inserted)}
+                if not 0 <= previous_events <= capacity or (previous_events < capacity and not append):
+                    raise ValueError("CVoM must append until its bank is full")
+                if self.writer_callback is not None and any(metrics.get(key) != value for key, value in expected.items()):
+                    raise ValueError("CVoM writer metrics disagree with its admission decision")
+                if session.long_bank.shape[1] != (previous_events + int(append)) * self.n_q:
+                    raise ValueError("CVoM writer changed whole-event capacity unexpectedly")
+                metrics.update(expected, writer_capacity=float(capacity))
+                session.appends += int(append)
+                session.replacements += int(replace)
+                session.demo_appends += int(passive and append)
+                session.demo_replacements += int(passive and replace)
             diagnostics = {
                 "policy": self.write_policy, "mode": self.mode, "memory_read_enabled": enabled,
                 "frame_index": frame, "passive": passive, "observations_seen": session.observations,
@@ -200,6 +258,11 @@ class RepresentationPolicyV18(LongMemoryPolicy):
                 "write_attempts": session.observations, "updates": session.updates, "keeps": session.keeps,
                 "demo_updates": session.demo_updates, "demo_keeps": session.demo_keeps, "read": metrics,
             }
+            if getattr(self, "cvom_admission", False):
+                diagnostics.update(writer_decision="append" if append else "replace:0" if replace else "keep",
+                    bank_events_before=previous_events, capacity_events=capacity,
+                    appends=session.appends, replacements=session.replacements,
+                    demo_appends=session.demo_appends, demo_replacements=session.demo_replacements)
             session.short_cache = head._memory_cache.detach().clone()
             session.raw_states = {key: np.array(value, copy=True) for key, value in step.states.items()}
             session.frame, session.passive = frame, passive
@@ -230,4 +293,8 @@ class RepresentationPolicyV18(LongMemoryPolicy):
             info.update(semantic_manifest_sha256=self.semantic_manifest_sha256,
                 semantic_payload_sha256=self.semantic_payload_sha256,
                 semantic_stage=self.stage, storage_manager_sha256=self.storage_manager_sha256)
+        if getattr(self, "cvom_admission", False):
+            info.update(cvom_manifest_sha256=self.cvom_manifest_sha256,
+                cvom_writer_sha256=self.cvom_writer_sha256, cvom_parent_identity=self.cvom_parent_identity,
+                cvom_source_sha256=self.cvom_source_sha256)
         return actions, info

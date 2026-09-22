@@ -51,6 +51,7 @@ SEMANTIC_DEPENDENCIES = (
     "semantic_memory_checkpoint.py", "semantic_memory_storage.py",
     "eval_semantic_memory.py",
 )
+CVOM_DEPENDENCIES = ("cvom_admission_core.py", "cvom_admission_checkpoint.py", "eval_cvom_admission.py")
 
 
 def build_parser():
@@ -58,6 +59,8 @@ def build_parser():
     p.add_argument("--base-model", type=Path, default=Path("checkpoints/author_hamlet_robomme/checkpoint-60000"))
     p.add_argument("--checkpoint", type=Path, help="One genuine V18 bundle, shared by every candidate role")
     p.add_argument("--writer-checkpoint", type=Path, help="Optional CVOM sidecar bound to this exact reader checkpoint")
+    p.add_argument("--cvom-admission", action="store_true",
+        help="Writer-only CVoM admission over the immutable V19 parent; FIFO bypasses only this controller")
     p.add_argument("--semantic-memory", action="store_true",
         help="Validate/load semantic.json extras; Stage-2 manager replaces legacy writer (never both)")
     p.add_argument("--baseline-reference", type=Path, help="Completed ORIGINAL run containing comparison_manifest.json; never a copied CSV")
@@ -97,6 +100,12 @@ def validate_options(args):
     if args.writer_checkpoint is not None and args.checkpoint is None:
         raise ValueError("A writer requires its --checkpoint reader")
     semantic = getattr(args, "semantic_memory", False)
+    cvom = getattr(args, "cvom_admission", False)
+    if cvom and (semantic or args.writer_checkpoint is None or args.feature_precision != "native"):
+        raise ValueError("CVoM admission requires its writer checkpoint, native precision, and no semantic manager")
+    if cvom and (args.tasks != list(TASKS) or args.dataset != "val" or args.n_episodes != 10
+                 or args.seed != 6 or args.n_action_steps != 16 or args.max_episode_steps != 1300):
+        raise ValueError("CVoM admission uses the fixed all-task VAL160/seed6/action16/max1300 panel")
     if semantic and (args.writer_checkpoint is not None or args.checkpoint is None):
         raise ValueError("Semantic memory requires --checkpoint and cannot use legacy --writer-checkpoint")
     if semantic and args.feature_precision != "native":
@@ -156,6 +165,52 @@ def validate_semantic_model(model):
     return storage is not None
 
 
+def validate_cvom_model(model):
+    """CVoM adds writer provenance; the actor and baseline contracts stay intact."""
+    from run_scripts.robomme.cvom_admission_core import AdmissionConfig
+    from run_scripts.robomme.policy_representation_v18 import CVOM_RUNTIME_SOURCES
+    block = model.get("cvom_admission")
+    if not isinstance(block, dict) or set(block) != {"manifest", "source_sha256"}:
+        raise ValueError("Incomplete CVoM admission provenance")
+    info = block["manifest"]
+    if (not isinstance(info, dict) or info.get("variant") != "cvom_admission_v1"
+            or info.get("format_version") != 1 or info.get("arm") not in ("single", "coalitional")
+            or type(info.get("step")) is not int or info["step"] < 0):
+        raise ValueError("Unsupported CVoM admission checkpoint")
+    if "semantic_memory" in model or not model.get("writer_checkpoint") or "writer_manifest" in model:
+        raise ValueError("CVoM admission cannot mix another storage manager")
+    if (info.get("metadata", {}).get("actor_frozen") is not True
+            or info.get("metadata", {}).get("future_inputs_at_inference") is not False):
+        raise ValueError("CVoM admission requires a frozen actor and causal inference inputs")
+    cfg = AdmissionConfig(**info["config"])
+    rcfg = model["representation_config"]
+    if (cfg.capacity_events != 32 or cfg.capacity_events != rcfg["capacity_events"]
+            or cfg.num_tokens != rcfg["num_short_tokens"] or cfg.dim != rcfg["hidden_dim"]):
+        raise ValueError("CVoM admission must match the parent's 32-event reader dimensions")
+    parent = info.get("parent_identity", {})
+    if (parent.get("path") != model["memory_checkpoint"]
+            or parent.get("checkpoint_sha256") != model["checkpoint_files_sha256"]["checkpoint.json"]
+            or parent.get("payload_sha256") != model.get("training_metadata", {}).get("payload_sha256")
+            or parent.get("base_model") != model["base_model"]):
+        raise ValueError("CVoM writer belongs to a different immutable parent")
+    hashes = model.get("writer_files_sha256", {})
+    if (not {"cvom_admission.json", "writer.safetensors"} <= set(hashes)
+            or info.get("payload_sha256") != {"writer.safetensors": hashes["writer.safetensors"]}
+            or info.get("writer_sha256") != hashes["writer.safetensors"]
+            or info.get("manifest_sha256") != hashes["cvom_admission.json"]
+            or info.get("files_sha256") != hashes):
+        raise ValueError("CVoM sidecar hash provenance differs")
+    sources = block["source_sha256"]
+    if not isinstance(sources, dict) or set(sources) != set(CVOM_RUNTIME_SOURCES):
+        raise ValueError("Incomplete CVoM runtime source provenance")
+    if any(not isinstance(value, str) or len(value) != 64
+           or any(c not in "0123456789abcdef" for c in value) for value in (*hashes.values(), *sources.values())):
+        raise ValueError("Malformed CVoM SHA256 provenance")
+    if model.get("feature_precision") != "native" or model.get("feature_precision_rules") != feature_precision_contract("native"):
+        raise ValueError("CVoM admission requires native feature precision")
+    return info
+
+
 def validate_manifest_contract(identity):
     if identity.get("format_version") != 1 or identity.get("trainer_variant") != VARIANT or identity.get("evaluation_id") != identity_digest(identity):
         raise ValueError("Changed or non-V18 evaluation manifest")
@@ -171,7 +226,7 @@ def validate_manifest_contract(identity):
             if (model.get("mode") != "none" or model.get("stage", 0) != 0 or model.get("memory_checkpoint") is not None
                     or model.get("write_policy") != "none" or model.get("write_policy_override") != "checkpoint"
                     or model.get("server_script") != BASELINE_SERVER
-                    or any(key in model for key in ("checkpoint_files_sha256", "representation_config", "writer_checkpoint", "semantic_memory"))):
+                    or any(key in model for key in ("checkpoint_files_sha256", "representation_config", "writer_checkpoint", "semantic_memory", "cvom_admission"))):
                 raise ValueError("Baseline must be ORIGINAL HAMLET without adapters")
             if model.get("feature_precision", "native") != "native" or "feature_precision_rules" in model:
                 raise ValueError("Original baseline precision must remain native")
@@ -183,7 +238,16 @@ def validate_manifest_contract(identity):
             hashes = model.get("checkpoint_files_sha256", {})
             if set(hashes) != {"checkpoint.json", "model.safetensors", "expert.safetensors"}:
                 raise ValueError("Incomplete candidate payload provenance")
-            if "semantic_memory" in model:
+            if "cvom_admission" in model:
+                admission = validate_cvom_model(model)
+                if ((admission["step"] == 0 or admission.get("metadata", {}).get("smoke_only") is True)
+                        and not identity.get("allow_initialization_checkpoints")):
+                    raise ValueError("Initialization/smoke-only CVoM writer is not a trained performance candidate")
+                if any(identity.get("source_sha256", {}).get("run_scripts/robomme/" + name) != digest
+                       for name, digest in model["cvom_admission"]["source_sha256"].items()):
+                    raise ValueError("CVoM runtime sources differ from evaluation provenance")
+                expected_policy = "cvom-admission" if role != "fifo" else "fifo"
+            elif "semantic_memory" in model:
                 has_storage = validate_semantic_model(model)
                 if (model["semantic_memory"]["manifest"]["metadata"].get("smoke_only") is True
                         and not identity.get("allow_initialization_checkpoints")):
@@ -258,7 +322,18 @@ def build_identity(args):
         cache = info["config"].get("train", {}).get("cache_dir")
         if cache:
             inputs.append(resolve_repo_path(Path(cache)))
-        if args.writer_checkpoint:
+        cvom = getattr(args, "cvom_admission", False)
+        if cvom:
+            from run_scripts.robomme.cvom_admission_checkpoint import inspect_checkpoint
+            from run_scripts.robomme.policy_representation_v18 import CVOM_RUNTIME_SOURCES
+            writer_path = resolve_repo_path(args.writer_checkpoint)
+            admission = inspect_checkpoint(writer_path, checkpoint, base_model=base)
+            common.update(writer_checkpoint=str(writer_path),
+                writer_files_sha256=admission["files_sha256"],
+                cvom_admission={"manifest": admission, "source_sha256": {
+                    name: file_hash(REPO_ROOT / "run_scripts/robomme" / name) for name in CVOM_RUNTIME_SOURCES}})
+            inputs.append(writer_path)
+        elif args.writer_checkpoint:
             from run_scripts.robomme.storage_cvom_v18 import storage_writer_info_v18
             writer_path = resolve_repo_path(args.writer_checkpoint)
             writer_cfg, writer_manifest = storage_writer_info_v18(writer_path, checkpoint)
@@ -274,6 +349,7 @@ def build_identity(args):
             model = copy.deepcopy(common)
             model.update(memory_off=role == "memory-off",
                 write_policy=("semantic-cvom" if semantic and semantic["storage_config"] is not None and role != "fifo"
+                    else "cvom-admission" if cvom and role != "fifo"
                     else "cvom" if args.writer_checkpoint and role != "fifo" else "fifo"),
                 description="SAME adapted short/AE, long READ bypassed" if role == "memory-off" else "V18 learned READ/fusion")
             models[role] = model
@@ -284,6 +360,8 @@ def build_identity(args):
     sources.update(Path("run_scripts/robomme") / name for name in DEPENDENCIES)
     if getattr(args, "semantic_memory", False):
         sources.update(Path("run_scripts/robomme") / name for name in SEMANTIC_DEPENDENCIES)
+    if getattr(args, "cvom_admission", False):
+        sources.update(Path("run_scripts/robomme") / name for name in CVOM_DEPENDENCIES)
     sources.add(Path(BASELINE_SERVER))
     print("[preflight] hashing immutable original HAMLET, candidate and source provenance ...", flush=True)
     identity = {"format_version": 1, "trainer_variant": VARIANT, "models": models,
@@ -315,7 +393,11 @@ def server_command(args, model, port):
         command += ["--feature-precision", model.get("feature_precision", "native")]
         if model["memory_off"]:
             command.append("--memory-off")
-        if model.get("writer_checkpoint") and model["write_policy"] == "cvom":
+        if "cvom_admission" in model:
+            command += ["--cvom-admission", "--writer-checkpoint", model["writer_checkpoint"]]
+            if model["write_policy"] == "fifo":
+                command.append("--cvom-fifo")
+        elif model.get("writer_checkpoint") and model["write_policy"] == "cvom":
             command += ["--writer-checkpoint", model["writer_checkpoint"]]
         if "semantic_memory" in model:
             command.append("--semantic-memory")
@@ -343,10 +425,41 @@ def verify_runtime_inputs(identity):
         validate_reference(identity["baseline_reference"], identity)
 
 
+def _validate_cvom_decision(memory, previous, *, passive, fifo, capacity, num_tokens):
+    """Check per-call decisions against cumulative counts and whole-event size."""
+    decision = memory.get("writer_decision")
+    if decision not in ("append", "keep", "replace:0"):
+        raise ValueError("Missing/invalid CVoM admission decision")
+    append, replace, keep = (int(decision == value) for value in ("append", "replace:0", "keep"))
+    before = min(previous.get("observations_seen", 0), capacity)
+    if (memory.get("bank_events_before") != before or memory.get("capacity_events") != capacity
+            or (before < capacity and not append) or (before == capacity and append)
+            or (fifo and keep)):
+        raise ValueError("CVoM runtime decision violates append/full-bank/FIFO contract")
+    current = dict(previous)
+    increments = {"observations_seen": 1, "write_attempts": 1, "appends": append, "replacements": replace,
+        "keeps": keep, "updates": append + replace, "demo_appends": int(passive) * append,
+        "demo_replacements": int(passive) * replace, "demo_keeps": int(passive) * keep,
+        "demo_updates": int(passive) * (append + replace)}
+    for key, increment in increments.items():
+        current[key] = previous.get(key, 0) + increment
+        if type(memory.get(key)) is not int or memory[key] != current[key]:
+            raise ValueError(f"CVoM runtime decision counter differs: {key}")
+    if memory.get("memory_tokens") != min(current["observations_seen"], capacity) * num_tokens:
+        raise ValueError("CVoM runtime bank size differs from its decisions")
+    metrics = memory.get("read", {})
+    for key, expected in {"writer_append": append, "writer_replace": replace, "writer_keep": keep,
+                          "writer_insert": append + replace, "writer_capacity": capacity}.items():
+        if type(metrics.get(key)) not in (int, float) or metrics[key] != expected:
+            raise ValueError(f"CVoM runtime decision metric differs: {key}")
+    return current
+
+
 def completed_read_diagnostics(root, role, manifest):
     """Only completed-session calls count; missing evidence is never a clean OFF."""
     model = manifest["models"][role]
     totals = {key: 0 for key in ("completed_sessions", "missing_sessions", "calls", "enabled_calls", "missing_identity")}
+    writer_totals = {key: 0 for key in ("appends", "replacements", "keeps", "demo_appends", "demo_replacements", "demo_keeps")}
     max_delta = 0.0
     for task in manifest["settings"]["tasks"]:
         rows = read_results(Path(root) / role / task / "simulation_results.csv", expected=manifest["settings"]["n_episodes"])
@@ -373,6 +486,7 @@ def completed_read_diagnostics(root, role, manifest):
                 totals["missing_sessions"] += 1
                 continue
             totals["completed_sessions"] += 1
+            cvom_progress = {}
             for record in calls:
                 info = record.get("info", {})
                 expected = {"checkpoint_variant": VARIANT, "checkpoint_step": model["step"],
@@ -387,6 +501,13 @@ def completed_read_diagnostics(root, role, manifest):
                         semantic_stage=semantic["manifest"]["stage"],
                         storage_manager_sha256=storage_hash,
                         writer_sha256=storage_hash if model["write_policy"] == "semantic-cvom" else None)
+                if "cvom_admission" in model:
+                    admission = model["cvom_admission"]["manifest"]
+                    expected.update(cvom_manifest_sha256=admission["manifest_sha256"],
+                        cvom_writer_sha256=admission["writer_sha256"],
+                        cvom_parent_identity=admission["parent_identity"],
+                        cvom_source_sha256=model["cvom_admission"]["source_sha256"],
+                        writer_sha256=admission["writer_sha256"] if model["write_policy"] == "cvom-admission" else None)
                 if "feature_precision" in model:
                     expected["feature_precision"] = model["feature_precision"]
                     expected["feature_precision_rules"] = model["feature_precision_rules"]
@@ -411,6 +532,11 @@ def completed_read_diagnostics(root, role, manifest):
                     raise ValueError("READ-off actually enabled retrieval")
                 if record.get("passive") is True and enabled:
                     raise ValueError("Passive demo unexpectedly requested READ")
+                if "cvom_admission" in model:
+                    cvom_progress = _validate_cvom_decision(memory, cvom_progress,
+                        passive=record.get("passive") is True, fifo=role == "fifo",
+                        capacity=model["representation_config"]["capacity_events"],
+                        num_tokens=model["representation_config"]["num_short_tokens"])
                 metrics = memory.get("read", {})
                 delta = metrics.get("ae_conditioning_delta_norm")
                 if type(delta) not in (int, float) or not math.isfinite(delta) or delta < 0:
@@ -421,9 +547,14 @@ def completed_read_diagnostics(root, role, manifest):
                         raise ValueError("READ bypass changed AE input relative to SAME adapted short")
                 totals["calls"] += 1
                 totals["enabled_calls"] += int(enabled)
-    return {**totals, "max_read_delta_norm": max_delta,
+            for key in writer_totals:
+                writer_totals[key] += cvom_progress.get(key, 0)
+    result = {**totals, "max_read_delta_norm": max_delta,
         "complete_evidence": totals["completed_sessions"] == len(manifest["settings"]["tasks"]) * manifest["settings"]["n_episodes"]
             and totals["missing_sessions"] == 0 and totals["missing_identity"] == 0}
+    if "cvom_admission" in model:
+        result["writer_decisions"] = writer_totals
+    return result
 
 
 def write_report(root, bootstrap_samples=5000):
@@ -533,7 +664,10 @@ def run_evaluation(args, identity, env):
             result, report = write_report(output)
             print(report, flush=True)
             print(f"[v18] Saved: {output / 'comparison_summary.txt'}", flush=True)
-    return int(bool(failures) or not all(model["complete"] for model in result["models"].values()))
+    cvom_evidence_complete = all(result["read_diagnostics"][role]["complete_evidence"]
+        for role, model in identity["models"].items() if "cvom_admission" in model)
+    return int(bool(failures) or not all(model["complete"] for model in result["models"].values())
+               or not cvom_evidence_complete)
 
 
 def main(argv=None):
